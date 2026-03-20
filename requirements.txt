@@ -1,0 +1,5 @@
+streamlit>=1.32.0
+requests>=2.31.0
+networkx>=3.2
+sentence-transformers>=2.6.0
+torch>=2.0.0

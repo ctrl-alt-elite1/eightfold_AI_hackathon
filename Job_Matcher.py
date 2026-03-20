@@ -2,7 +2,6 @@ import torch
 from sentence_transformers import SentenceTransformer, util
 import json
 import re
-import ollama
 
 class TalentMatcher:
     def __init__(self):
@@ -79,6 +78,7 @@ class TalentMatcher:
         """
         
         try:
+            import ollama
             #calling local ollama instance('ollama run phi3' is active)
             response = ollama.chat(
                 model='phi3',
