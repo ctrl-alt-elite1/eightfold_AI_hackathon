@@ -8,10 +8,13 @@ MIN_COMMIT_THRESHOLD = 5 # Minimum commits to "Verify" a skill
 import os
 import json
 import time
+import logging
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
+logger = logging.getLogger(__name__)
 
 # --- API ---
 GITHUB_API_BASE  = "https://api.github.com"
@@ -66,35 +69,41 @@ RISK_DEPTH_MAX       = 50
 RISK_CONSISTENCY_MAX = 40
 RISK_REPOS_MIN       = 3
 
-# --- LANGUAGE → SKILL MAP ---
-LANGUAGE_SKILL_MAP: dict[str, list[str]] = {
-    "Python":           ["Backend Development", "AI/ML", "Scripting"],
-    "Jupyter Notebook": ["AI/ML", "Data Science"],
-    "R":                ["Data Science", "AI/ML"],
-    "JavaScript":       ["Frontend Development", "Backend Development"],
-    "TypeScript":       ["Frontend Development", "Backend Development"],
-    "HTML":             ["Frontend Development"],
-    "CSS":              ["Frontend Development"],
-    "Java":             ["Backend Development", "Android"],
-    "Kotlin":           ["Android", "Backend Development"],
-    "Swift":            ["iOS Development"],
-    "C":                ["Systems Programming"],
-    "C++":              ["Systems Programming", "Competitive Programming"],
-    "C#":               ["Backend Development", ".NET"],
-    "Go":               ["Backend Development", "DevOps"],
-    "Rust":             ["Systems Programming"],
-    "PHP":              ["Backend Development", "Web Development"],
-    "Ruby":             ["Backend Development", "Web Development"],
-    "Shell":            ["DevOps", "Scripting"],
-    "Dockerfile":       ["DevOps"],
-    "YAML":             ["DevOps"],
-    "SQL":              ["Database"],
-    "PLpgSQL":          ["Database"],
-    "Scala":            ["Backend Development", "Data Engineering"],
-    "Dart":             ["Mobile Development"],
-    "Lua":              ["Scripting", "Game Development"],
-}
+# --- RATE LIMIT ---
+RATE_LIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
+RATE_LIMIT_RESET_HEADER     = "X-RateLimit-Reset"
+RATE_LIMIT_SAFETY_BUFFER    = 10   # pause if fewer than this many requests remain
 
+# --- LANGUAGE → SKILL MAP ---
+# --- ENRICHED LANGUAGE → SKILL MAP ---
+LANGUAGE_SKILL_MAP: dict[str, list[str]] = {
+    "Python":           ["Backend Development", "Machine Learning", "Data Science", "Data Processing", "Scripting", "Algorithms"],
+    "Jupyter Notebook": ["Machine Learning", "Data Science", "Data Analysis", "AI"],
+    "R":                ["Data Science", "Statistical Modeling", "Data Analysis"],
+    "JavaScript":       ["Frontend Development", "Backend Development", "Web Development", "Node.js", "UI/UX"],
+    "TypeScript":       ["Frontend Development", "Backend Development", "Web Development", "System Architecture", "React"],
+    "HTML":             ["Frontend Development", "Web Design", "UI/UX"],
+    "CSS":              ["Frontend Development", "Web Design", "UI/UX"],
+    "Java":             ["Backend Development", "Enterprise Architecture", "Android", "System Architecture"],
+    "Kotlin":           ["Android Development", "Mobile Development", "Backend Development"],
+    "Swift":            ["iOS Development", "Mobile Development"],
+    "C":                ["Systems Programming", "Kernel Development", "Embedded Systems", "Operating Systems"],
+    "C++":              ["Systems Programming", "High-Performance Computing", "Game Development", "Algorithms"],
+    "C#":               ["Backend Development", ".NET", "Game Development", "Enterprise Architecture"],
+    "Go":               ["Backend Development", "Cloud Infrastructure", "Microservices", "DevOps", "AWS"],
+    "Rust":             ["Systems Programming", "Memory Safety", "High-Performance Computing", "WebAssembly"],
+    "PHP":              ["Backend Development", "Web Development"],
+    "Ruby":             ["Backend Development", "Web Development", "Scripting"],
+    "Shell":            ["DevOps", "Scripting", "Linux", "CI/CD", "Automation"],
+    "Dockerfile":       ["DevOps", "Containerization", "Cloud Infrastructure", "Docker"],
+    "YAML":             ["DevOps", "CI/CD", "Kubernetes", "Cloud Infrastructure", "AWS"],
+    "SQL":              ["Database Design", "Data Analysis", "Backend Development", "Relational Databases"],
+    "PLpgSQL":          ["Database Design", "Backend Development"],
+    "Scala":            ["Backend Development", "Data Engineering", "Big Data"],
+    "Dart":             ["Mobile Development", "Cross-Platform Development", "Frontend Development"],
+    "Lua":              ["Scripting", "Game Development"],
+    "Vue":              ["Frontend Development", "Web Development", "UI/UX"]
+}
 
 # ---------------------------------------------------------------------------
 # CACHE UTILITIES
@@ -130,6 +139,56 @@ def _save_cache(username: str, data: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# FIX 3 — RATE LIMIT HANDLING
+# ---------------------------------------------------------------------------
+
+def _check_rate_limit(response: requests.Response) -> None:
+    """
+    Inspects GitHub rate-limit headers on every response.
+    If the remaining request budget falls below the safety buffer,
+    sleeps until the reset window opens.
+
+    Raises RateLimitError on HTTP 403/429 when the reset time cannot
+    be determined (e.g. secondary / abuse-detection limits).
+    """
+    status = response.status_code
+
+    # Primary rate limit exhausted — GitHub returns 403 with a Retry-After
+    # header, or 429 in newer API versions.
+    if status in (403, 429):
+        reset_ts = response.headers.get(RATE_LIMIT_RESET_HEADER)
+        if reset_ts:
+            sleep_for = max(0, int(reset_ts) - int(time.time())) + 1
+            logger.warning(
+                "GitHub rate limit hit (HTTP %s). Sleeping %ds until reset.",
+                status, sleep_for,
+            )
+            time.sleep(sleep_for)
+        else:
+            # Secondary / abuse-detection limit — no reset header available.
+            # Back off for 60 s as a safe default.
+            logger.warning(
+                "GitHub secondary rate limit hit (HTTP %s). Backing off 60 s.",
+                status,
+            )
+            time.sleep(60)
+        return
+
+    # Proactive throttle: slow down before hitting the wall.
+    remaining = response.headers.get(RATE_LIMIT_REMAINING_HEADER)
+    if remaining is not None and int(remaining) < RATE_LIMIT_SAFETY_BUFFER:
+        reset_ts = response.headers.get(RATE_LIMIT_RESET_HEADER)
+        if reset_ts:
+            sleep_for = max(0, int(reset_ts) - int(time.time())) + 1
+            logger.warning(
+                "Approaching GitHub rate limit (%s requests left). "
+                "Sleeping %ds until reset.",
+                remaining, sleep_for,
+            )
+            time.sleep(sleep_for)
+
+
+# ---------------------------------------------------------------------------
 # LAYER 1 — DATA COLLECTION
 # ---------------------------------------------------------------------------
 
@@ -154,6 +213,9 @@ def fetch_repositories(username: str) -> list[dict[str, Any]]:
             params={"per_page": MAX_REPOS_FETCH, "sort": "updated", "type": "owner"},
             timeout=10,
         )
+        # FIX 3: check rate limit on every response
+        _check_rate_limit(repos_resp)
+
         if repos_resp.status_code != 200:
             return []
 
@@ -164,37 +226,70 @@ def fetch_repositories(username: str) -> list[dict[str, Any]]:
         _save_cache(username, raw)
         return raw
 
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("Failed to fetch repositories for '%s': %s", username, exc)
         return []
 
 
+# FIX 1 — replaced bare `except:` with specific exception types
+# FIX 3 — added rate-limit inspection on every API response
 def fetch_user_contribution_stats(username: str, repo_name: str) -> int:
-    headers = {"Accept": "application/vnd.github+json"}
+    """Returns total commits by user. Handles GitHub 202 'Calculating' status."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
     url = f"{GITHUB_API_BASE}/repos/{username}/{repo_name}/stats/contributors"
-    
-    # Retry logic: Try up to 3 times if we get a 202
-    for _ in range(3):
-        resp = requests.get(url, headers=headers, timeout=10)
-        
-        if resp.status_code == 200:
-            stats = resp.json()
-            for contributor in stats:
-                if contributor['author']['login'].lower() == username.lower():
-                    return int(contributor['total'])
+
+    # Retry up to 3 times if GitHub returns 202 (Calculating)
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+
+            # FIX 3: inspect rate-limit headers / handle 403/429
+            _check_rate_limit(resp)
+
+            if resp.status_code == 200:
+                stats = resp.json()
+                if not stats:
+                    return 0
+                for contributor in stats:
+                    if contributor["author"]["login"].lower() == username.lower():
+                        return int(contributor["total"])
+                return 0
+
+            elif resp.status_code == 202:
+                # GitHub is still calculating; wait before retrying
+                time.sleep(1.0)
+                continue
+
+            else:
+                logger.debug(
+                    "Unexpected status %s for %s/%s (attempt %d/3)",
+                    resp.status_code, username, repo_name, attempt + 1,
+                )
+                return 0
+
+        # FIX 1 — was bare `except:`, now catches only the two expected families
+        except requests.RequestException as exc:
+            logger.warning(
+                "Network error fetching stats for %s/%s: %s",
+                username, repo_name, exc,
+            )
             return 0
-            
-        elif resp.status_code == 202:
-            # GitHub is calculating. Wait a bit and try again.
-            time.sleep(1.0) 
-            continue
-            
-        else:
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning(
+                "Unexpected payload for %s/%s: %s",
+                username, repo_name, exc,
+            )
             return 0
+
     return 0
+
 
 def normalize_repo_data(raw_repos: list[dict]) -> list[dict[str, Any]]:
     """Clean and format raw GitHub API data."""
@@ -218,10 +313,10 @@ def normalize_repo_data(raw_repos: list[dict]) -> list[dict[str, Any]]:
             "created_at":  _parse_date(repo.get("created_at")),
             "updated_at":  _parse_date(repo.get("updated_at")),
             "topics":      list(repo.get("topics") or []),
-            # We don't fetch commit_count here anymore!
         })
 
     return normalized
+
 
 def _parse_date(date_str: Any) -> datetime | None:
     if not date_str or not isinstance(date_str, str):
@@ -244,20 +339,20 @@ def analyze_skill_evidence(repos: list[dict[str, Any]]) -> dict[str, Any]:
     cutoff = now - timedelta(days=ACTIVE_REPO_DAYS)
     total_repos = len(repos)
 
-    # Accumulators
-    lang_stats: dict[str, dict] = {} # { "Python": {"commits": 0, "repos": 0, "recent": 0} }
+    lang_stats: dict[str, dict] = {}
 
     for repo in repos:
         lang = repo.get("language")
-        if not lang: continue
-        
+        if not lang:
+            continue
+
         if lang not in lang_stats:
             lang_stats[lang] = {"commits": 0, "repos": 0, "recent": 0}
-        
+
         commits = repo.get("commit_count", 0)
         lang_stats[lang]["commits"] += commits
         lang_stats[lang]["repos"] += 1
-        
+
         updated = repo.get("updated_at")
         if updated and updated >= cutoff:
             lang_stats[lang]["recent"] += 1
@@ -265,33 +360,22 @@ def analyze_skill_evidence(repos: list[dict[str, Any]]) -> dict[str, Any]:
     if not lang_stats:
         return {"skills": {}, "skill_score": 0}
 
-    # Identify primary language by commit volume, not just repo count
     primary_lang = max(lang_stats, key=lambda l: lang_stats[l]["commits"])
 
     lang_confidence: dict[str, float] = {}
     for lang, stats in lang_stats.items():
-        # 1. Workload Score (Volume of Code): 50 pts
-        # Benchmarked at 50 commits for "Mastery" in a hackathon context
-        work_score = min(stats["commits"] / 50, 1.0) * 50
-        
-        # 2. Consistency Score (Spread across projects): 30 pts
-        freq_score = min(stats["repos"] / total_repos, 1.0) * 30
-        
-        # 3. Recency Score (Active usage): 20 pts
+        work_score    = min(stats["commits"] / 150, 1.0) * 50
+        freq_score    = min(stats["repos"] / total_repos, 1.0) * 30
         recency_score = (stats["recent"] / stats["repos"]) * 20
-        
-        # Bonus for the language they use the most
-        bonus = 10 if lang == primary_lang else 0
-        
+        bonus         = 10 if lang == primary_lang else 0
         lang_confidence[lang] = round(min(work_score + freq_score + recency_score + bonus, 100), 1)
 
-    # Map to professional skills (Existing logic)
     skill_scores: dict[str, list[float]] = {}
     for lang, confidence in lang_confidence.items():
         for skill in LANGUAGE_SKILL_MAP.get(lang, [lang]):
             skill_scores.setdefault(skill, []).append(confidence)
 
-    skills = {s: round(sum(v)/len(v), 1) for s, v in skill_scores.items()}
+    skills = {s: round(sum(v) / len(v), 1) for s, v in skill_scores.items()}
     skill_score = round(sum(skills.values()) / len(skills), 1) if skills else 0
 
     return {"skills": skills, "skill_score": skill_score}
@@ -305,37 +389,33 @@ def analyze_engineering_behavior(repos: list[dict[str, Any]]) -> dict[str, Any]:
     if not repos:
         return {"consistency": 0, "exploration": 0, "depth": 0, "behavior_score": 0}
 
-    now = datetime.now(timezone.utc)
+    now    = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=ACTIVE_REPO_DAYS)
-    total = len(repos)
+    total  = len(repos)
 
-    # 1. Consistency: How many repos were updated recently?
-    active_count = sum(1 for r in repos if r.get("updated_at") and r["updated_at"] >= cutoff)
-    consistency = round((active_count / total) * 100, 1)
+    active_count  = sum(1 for r in repos if r.get("updated_at") and r["updated_at"] >= cutoff)
+    consistency   = round((active_count / total) * 100, 1)
 
-    # 2. Exploration: Variety of languages used
-    unique_langs = len(set(r["language"] for r in repos if r.get("language")))
-    exploration = round(min(unique_langs * 15, 100), 1)
+    unique_langs  = len(set(r["language"] for r in repos if r.get("language")))
+    exploration   = round(min((unique_langs / max(total, 1)) * 150, 100), 1)
 
-    # 3. NEW Depth: Percentage of repos that are "Verified" (5+ commits)
-    # This proves the candidate builds things rather than just forking/starring.
     verified_repos = sum(1 for r in repos if r.get("commit_count", 0) >= 5)
-    depth = round((verified_repos / total) * 100, 1)
+    depth          = round((verified_repos / total) * 100, 1)
 
-    # Calculate overall behavior score with new weights
     behavior_score = round(
-        consistency * 0.3 + 
-        exploration * 0.3 + 
-        depth * 0.4, # Weight depth slightly higher for "High Trust"
-        1
+        consistency * 0.3 +
+        exploration * 0.3 +
+        depth       * 0.4,
+        1,
     )
 
     return {
-        "consistency": consistency,
-        "exploration": exploration,
-        "depth": depth,
+        "consistency":    consistency,
+        "exploration":    exploration,
+        "depth":          depth,
         "behavior_score": behavior_score,
     }
+
 
 # ---------------------------------------------------------------------------
 # LAYER 4 — DEVELOPER PROFILE ENGINE
@@ -360,7 +440,6 @@ def classify_developer_profile(
     exploration = behavior.get("exploration", 0)
     depth       = behavior.get("depth", 0)
 
-    # Archetype — priority: Maintainer > Builder > Explorer > Generalist
     if consistency >= MAINTAINER_CONSISTENCY_MIN:
         archetype = "Maintainer"
     elif depth >= BUILDER_DEPTH_MIN and total >= BUILDER_REPOS_MIN:
@@ -370,9 +449,8 @@ def classify_developer_profile(
     else:
         archetype = "Generalist"
 
-    # Learning velocity — new languages in last 12 months
-    now          = datetime.now(timezone.utc)
-    cutoff_12m   = now - timedelta(days=365)
+    now        = datetime.now(timezone.utc)
+    cutoff_12m = now - timedelta(days=365)
 
     older_langs = set(
         r["language"] for r in repos
@@ -396,10 +474,10 @@ def classify_developer_profile(
         learning_velocity = "LOW"
 
     potential_score = round(
-        depth       * POTENTIAL_DEPTH +
+        depth       * POTENTIAL_DEPTH       +
         consistency * POTENTIAL_CONSISTENCY +
         exploration * POTENTIAL_EXPLORATION,
-        1
+        1,
     )
 
     return {
@@ -425,7 +503,7 @@ def compute_engineering_scores(
     potential_score = profile.get("potential_score", 0)
     consistency     = behavior.get("consistency", 0)
     exploration     = behavior.get("exploration", 0)
-    activity_score  = min(repo_count * 10, 100)
+    activity_score = min(repo_count * 10, 100)
 
     overall_score = round(max(0, min(100,
         skill_score     * WEIGHT_SKILLS    +
@@ -436,21 +514,21 @@ def compute_engineering_scores(
     )), 1)
 
     breakdown = {
-        "skills":    round(skill_score    * WEIGHT_SKILLS,    1),
-        "behavior":  round(behavior_score * WEIGHT_BEHAVIOR,  1),
-        "depth":     round(depth          * WEIGHT_DEPTH,     1),
-        "potential": round(potential_score* WEIGHT_POTENTIAL, 1),
-        "activity":  round(activity_score * WEIGHT_ACTIVITY,  1),
+        "skills":    round(skill_score     * WEIGHT_SKILLS,    1),
+        "behavior":  round(behavior_score  * WEIGHT_BEHAVIOR,  1),
+        "depth":     round(depth           * WEIGHT_DEPTH,     1),
+        "potential": round(potential_score * WEIGHT_POTENTIAL, 1),
+        "activity":  round(activity_score  * WEIGHT_ACTIVITY,  1),
     }
 
     strengths = []
-    if skill_score     > STRENGTH_SKILL_MIN:       strengths.append("Strong technical skill evidence")
-    if consistency     > STRENGTH_CONSISTENCY_MIN:  strengths.append("Consistent development activity")
-    if depth           > STRENGTH_DEPTH_MIN:        strengths.append("Strong project completion signals")
+    if skill_score  > STRENGTH_SKILL_MIN:       strengths.append("Strong technical skill evidence")
+    if consistency  > STRENGTH_CONSISTENCY_MIN: strengths.append("Consistent development activity")
+    if depth        > STRENGTH_DEPTH_MIN:       strengths.append("Strong project completion signals")
 
     risks = []
-    if depth       < RISK_DEPTH_MAX:        risks.append("Limited project depth")
-    if consistency < RISK_CONSISTENCY_MAX:  risks.append("Low recent activity")
+    if depth       < RISK_DEPTH_MAX:       risks.append("Limited project depth")
+    if consistency < RISK_CONSISTENCY_MAX: risks.append("Low recent activity")
 
     return {
         "overall_score": overall_score,
@@ -470,16 +548,15 @@ def generate_analytics_data(
     scores: dict[str, Any],
 ) -> dict[str, Any]:
     empty = {
-        "activity_timeline":    {},
-        "skill_distribution":   {},
+        "activity_timeline":      {},
+        "skill_distribution":     {},
         "intelligence_breakdown": {},
-        "tech_evolution":       {},
+        "tech_evolution":         {},
     }
 
     if not repos:
         return empty
 
-    # Activity timeline — repos created per year
     activity_timeline: dict[str, int] = {}
     for repo in repos:
         created = repo.get("created_at")
@@ -487,13 +564,9 @@ def generate_analytics_data(
             year = str(created.year)
             activity_timeline[year] = activity_timeline.get(year, 0) + 1
 
-    # Skill distribution
-    skill_distribution = skills.get("skills", {})
-
-    # Intelligence breakdown
+    skill_distribution    = skills.get("skills", {})
     intelligence_breakdown = scores.get("breakdown", {})
 
-    # Tech evolution — languages appearing per year (using created_at)
     tech_evolution: dict[str, list[str]] = {}
     for repo in repos:
         lang    = repo.get("language")
@@ -505,7 +578,6 @@ def generate_analytics_data(
             if lang not in tech_evolution[year]:
                 tech_evolution[year].append(lang)
 
-    # Make cumulative — each year shows all languages seen so far
     sorted_years = sorted(tech_evolution.keys())
     seen: set[str] = set()
     cumulative: dict[str, list[str]] = {}
@@ -606,110 +678,94 @@ def _empty_result() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def analyze_github(username: str) -> dict[str, Any]:
-    # 1. Fetch raw list
+    # 1. Fetch & Normalize basic repo list
     raw_repos = fetch_repositories(username)
     if not raw_repos:
         return _empty_result()
 
-    # 2. Normalize (No username needed here anymore)
     repos = normalize_repo_data(raw_repos)
     if not repos:
         return _empty_result()
 
-    # 3. Sort by recency (Standard Hackathon Strategy)
-    repos = sorted(
-        repos, 
-        key=lambda x: x.get('updated_at') or datetime.min.replace(tzinfo=timezone.utc), 
-        reverse=True
-    )
-    
-    # 4. Deep Verification (Where the 'username' is used)
-    top_repos = repos[:5]
-    other_repos = repos[5:]
+    # 2. Preparation for Parallel Verification
+    def verify_repo_worker(repo: dict) -> dict:
+        count = fetch_user_contribution_stats(username, repo["name"])
+        repo["commit_count"] = count
+        repo["is_verified"]  = count >= MIN_COMMIT_THRESHOLD
+        return repo
 
-    for repo in top_repos:
-        # We have the username here, so no NameError!
-        repo['commit_count'] = fetch_user_contribution_stats(username, repo['name'])
-        repo['is_verified'] = repo['commit_count'] >= 5
-        
-    for repo in other_repos:
-        repo['commit_count'] = 1  # Standard weight for non-verified repos
-        repo['is_verified'] = False
+    print(f"--- Deeply verifying {len(repos)} repositories in parallel ---")
 
-    verified_repos = top_repos + other_repos
+    # 3. THE PARALLEL ENGINE
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        verified_repos = list(executor.map(verify_repo_worker, repos))
 
-    # 5. Pass the verified data to your analysis engines
-    skills    = analyze_skill_evidence(verified_repos)
-    behavior  = analyze_engineering_behavior(verified_repos)
-    profile   = classify_developer_profile(verified_repos, behavior, skills)
+    # 4. Analysis Engines
+    skills   = analyze_skill_evidence(verified_repos)
+    behavior = analyze_engineering_behavior(verified_repos)
+    profile  = classify_developer_profile(verified_repos, behavior, skills)
+
+    # 5. Final Scoring
     scores    = compute_engineering_scores(skills, behavior, profile, len(verified_repos))
     analytics = generate_analytics_data(verified_repos, skills, scores)
 
     return merge_outputs(skills, behavior, profile, scores, analytics, verified_repos)
+
+
 # ---------------------------------------------------------------------------
-# MAIN RUNNER (TEST EXECUTION)
+# MAIN RUNNER
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
     print("\nGitHub Engineering Intelligence Analyzer\n")
 
     username = input("Enter GitHub username: ").strip()
-
     if not username:
         print("Invalid username")
         return
 
     print("\nAnalyzing profile...\n")
 
-    result = analyze_github(username)
-
-    intel = result["github_engineering_intelligence"]
-    profile = result["developer_profile"]
+    result   = analyze_github(username)
+    intel    = result["github_engineering_intelligence"]
+    profile  = result["developer_profile"]
     behavior = result["engineering_behavior"]
-    skills = result["skill_evidence"]
+    skills   = result["skill_evidence"]
 
     print("===== ENGINEERING INTELLIGENCE REPORT =====\n")
-
-    print(f"Overall Score: {intel['overall_score']}/100")
-    print(f"Confidence: {intel['confidence']}")
-    print(f"Archetype: {profile['archetype']}")
+    print(f"Overall Score:     {intel['overall_score']}/100")
+    print(f"Confidence:        {intel['confidence']}")
+    print(f"Archetype:         {profile['archetype']}")
     print(f"Learning Velocity: {profile['learning_velocity']}")
 
     print("\n--- Behavior Signals ---")
-
     print(f"Consistency: {behavior['consistency']}")
     print(f"Exploration: {behavior['exploration']}")
-    print(f"Depth: {behavior['depth']}")
+    print(f"Depth:       {behavior['depth']}")
 
     print("\n--- Top Skills ---")
-
     top_skills = sorted(
         skills["skills"].items(),
         key=lambda x: x[1],
-        reverse=True
+        reverse=True,
     )[:5]
 
-    for skill, score in top_skills:
-        print(f"{skill}: {score}")
-
-    print("\n--- Strengths ---")
-
-    for s in intel["strengths"]:
-        print(f"+ {s}")
-
-    print("\n--- Risks ---")
-
-    for r in intel["risks"]:
-        print(f"- {r}")
-    
-    # Add a "Verified" badge in the UI/Terminal
+    # re-printed every skill without the VERIFIED/LOW SIGNAL label
     for skill, score in top_skills:
         status = "VERIFIED EVIDENCE" if score > 70 else "LOW SIGNAL"
-        print(f"{skill}: {score} [{status}]")
+        print(f"  {skill}: {score} [{status}]")
+
+    print("\n--- Strengths ---")
+    for s in intel["strengths"]:
+        print(f"  + {s}")
+
+    print("\n--- Risks ---")
+    for r in intel["risks"]:
+        print(f"  - {r}")
 
     print("\n==========================================\n")
-    
 
 
 if __name__ == "__main__":
