@@ -55,6 +55,7 @@ class TalentMatcher:
         """
         
         try:
+            import ollama
             response = ollama.chat(
                 model='phi3',
                 messages=[
