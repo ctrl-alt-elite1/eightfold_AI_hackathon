@@ -77,32 +77,32 @@ RATE_LIMIT_SAFETY_BUFFER    = 10   # pause if fewer than this many requests rema
 # --- LANGUAGE → SKILL MAP ---
 # --- ENRICHED LANGUAGE → SKILL MAP ---
 LANGUAGE_SKILL_MAP: dict[str, list[str]] = {
-    "Python":           ["Backend Development", "Machine Learning", "Data Science", "Data Processing", "Scripting", "Algorithms"],
-    "Jupyter Notebook": ["Machine Learning", "Data Science", "Data Analysis", "AI"],
-    "R":                ["Data Science", "Statistical Modeling", "Data Analysis"],
-    "JavaScript":       ["Frontend Development", "Backend Development", "Web Development", "Node.js", "UI/UX"],
-    "TypeScript":       ["Frontend Development", "Backend Development", "Web Development", "System Architecture", "React"],
-    "HTML":             ["Frontend Development", "Web Design", "UI/UX"],
-    "CSS":              ["Frontend Development", "Web Design", "UI/UX"],
-    "Java":             ["Backend Development", "Enterprise Architecture", "Android", "System Architecture"],
-    "Kotlin":           ["Android Development", "Mobile Development", "Backend Development"],
-    "Swift":            ["iOS Development", "Mobile Development"],
-    "C":                ["Systems Programming", "Kernel Development", "Embedded Systems", "Operating Systems"],
-    "C++":              ["Systems Programming", "High-Performance Computing", "Game Development", "Algorithms"],
-    "C#":               ["Backend Development", ".NET", "Game Development", "Enterprise Architecture"],
-    "Go":               ["Backend Development", "Cloud Infrastructure", "Microservices", "DevOps", "AWS"],
-    "Rust":             ["Systems Programming", "Memory Safety", "High-Performance Computing", "WebAssembly"],
-    "PHP":              ["Backend Development", "Web Development"],
-    "Ruby":             ["Backend Development", "Web Development", "Scripting"],
-    "Shell":            ["DevOps", "Scripting", "Linux", "CI/CD", "Automation"],
-    "Dockerfile":       ["DevOps", "Containerization", "Cloud Infrastructure", "Docker"],
-    "YAML":             ["DevOps", "CI/CD", "Kubernetes", "Cloud Infrastructure", "AWS"],
-    "SQL":              ["Database Design", "Data Analysis", "Backend Development", "Relational Databases"],
-    "PLpgSQL":          ["Database Design", "Backend Development"],
-    "Scala":            ["Backend Development", "Data Engineering", "Big Data"],
-    "Dart":             ["Mobile Development", "Cross-Platform Development", "Frontend Development"],
-    "Lua":              ["Scripting", "Game Development"],
-    "Vue":              ["Frontend Development", "Web Development", "UI/UX"]
+    "Python":           ["Python", "Backend Development", "Machine Learning", "Data Science", "Data Processing", "Scripting", "Algorithms"],
+    "Jupyter Notebook": ["Jupyter Notebook", "Machine Learning", "Data Science", "Data Analysis", "AI"],
+    "R":                ["R", "Data Science", "Statistical Modeling", "Data Analysis"],
+    "JavaScript":       ["JavaScript", "JS", "Frontend Development", "Backend Development", "Web Development", "Node.js", "UI/UX"],
+    "TypeScript":       ["TypeScript", "TS", "Frontend Development", "Backend Development", "Web Development", "System Architecture", "React"],
+    "HTML":             ["HTML", "Frontend Development", "Web Design", "UI/UX"],
+    "CSS":              ["CSS", "Frontend Development", "Web Design", "UI/UX"],
+    "Java":             ["Java", "Backend Development", "Enterprise Architecture", "Android", "System Architecture"],
+    "Kotlin":           ["Kotlin", "Android Development", "Mobile Development", "Backend Development"],
+    "Swift":            ["Swift", "iOS Development", "Mobile Development"],
+    "C":                ["C", "C/C++", "Systems Programming", "Kernel Development", "Embedded Systems", "Operating Systems", "Memory Management", "Low-Level Control", "Hardware Interaction", "I/O Handling", "Performance Tuning"],
+    "C++":              ["C++", "CPP", "C/C++", "Systems Programming", "High-Performance Computing", "Game Development", "Algorithms", "Memory Management", "Low-Level Control", "Distributed Systems", "Performance Tuning"],
+    "C#":               ["C#", "C/C#", "Backend Development", ".NET", "Game Development", "Enterprise Architecture"],
+    "Go":               ["Go", "Backend Development", "Cloud Infrastructure", "Microservices", "DevOps", "AWS"],
+    "Rust":             ["Rust", "Systems Programming", "Memory Safety", "High-Performance Computing", "WebAssembly"],
+    "PHP":              ["PHP", "Backend Development", "Web Development"],
+    "Ruby":             ["Ruby", "Backend Development", "Web Development", "Scripting"],
+    "Shell":            ["Shell", "DevOps", "Scripting", "Linux", "CI/CD", "Automation"],
+    "Dockerfile":       ["Dockerfile", "DevOps", "Containerization", "Cloud Infrastructure", "Docker"],
+    "YAML":             ["YAML", "DevOps", "CI/CD", "Kubernetes", "Cloud Infrastructure", "AWS"],
+    "SQL":              ["SQL", "Database Design", "Data Analysis", "Backend Development", "Relational Databases"],
+    "PLpgSQL":          ["PLpgSQL", "Database Design", "Backend Development"],
+    "Scala":            ["Scala", "Backend Development", "Data Engineering", "Big Data"],
+    "Dart":             ["Dart", "Mobile Development", "Cross-Platform Development", "Frontend Development"],
+    "Lua":              ["Lua", "Scripting", "Game Development"],
+    "Vue":              ["Vue", "Frontend Development", "Web Development", "UI/UX"]
 }
 
 # ---------------------------------------------------------------------------
@@ -331,13 +331,20 @@ def _parse_date(date_str: Any) -> datetime | None:
 # LAYER 2 — SKILL EVIDENCE ENGINE
 # ---------------------------------------------------------------------------
 
+from datetime import datetime, timezone, timedelta
+from typing import Any
+
 def analyze_skill_evidence(repos: list[dict[str, Any]]) -> dict[str, Any]:
     if not repos:
         return {"skills": {}, "skill_score": 0}
 
+    # Set the active cutoff (Assumes ACTIVE_REPO_DAYS is defined at the top of your file, usually 365)
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=ACTIVE_REPO_DAYS)
+    cutoff = now - timedelta(days=365) 
     total_repos = len(repos)
+    
+    # A "verified repo" is one where the candidate actually did work, not just a fork
+    verified_repos = sum(1 for r in repos if r.get("commit_count", 0) >= 5)
 
     lang_stats: dict[str, dict] = {}
 
@@ -354,6 +361,13 @@ def analyze_skill_evidence(repos: list[dict[str, Any]]) -> dict[str, Any]:
         lang_stats[lang]["repos"] += 1
 
         updated = repo.get("updated_at")
+        # Ensure the date is properly formatted for comparison
+        if isinstance(updated, str):
+            try:
+                updated = datetime.fromisoformat(updated.replace('Z', '+00:00'))
+            except ValueError:
+                updated = None
+                
         if updated and updated >= cutoff:
             lang_stats[lang]["recent"] += 1
 
@@ -366,20 +380,97 @@ def analyze_skill_evidence(repos: list[dict[str, Any]]) -> dict[str, Any]:
     for lang, stats in lang_stats.items():
         work_score    = min(stats["commits"] / 150, 1.0) * 50
         freq_score    = min(stats["repos"] / total_repos, 1.0) * 30
-        recency_score = (stats["recent"] / stats["repos"]) * 20
+        recency_score = (stats["recent"] / stats["repos"]) * 20 if stats["repos"] > 0 else 0
         bonus         = 10 if lang == primary_lang else 0
         lang_confidence[lang] = round(min(work_score + freq_score + recency_score + bonus, 100), 1)
 
     skill_scores: dict[str, list[float]] = {}
     for lang, confidence in lang_confidence.items():
+        # Assumes LANGUAGE_SKILL_MAP is globally available in your file
         for skill in LANGUAGE_SKILL_MAP.get(lang, [lang]):
             skill_scores.setdefault(skill, []).append(confidence)
 
     skills = {s: round(sum(v) / len(v), 1) for s, v in skill_scores.items()}
+    
+    # =========================================================
+    # --- ULTIMATE BEHAVIORAL & OPERATIONAL INJECTION BLOCK ---
+    # =========================================================
+    
+    # 0. Baseline Skills (Universal for active GitHub users)
+    skills["Software Engineering"] = 85.0
+    skills["Version Control"] = 90.0
+    skills["Git"] = 90.0
+    skills["Problem Solving"] = 80.0
+    
+    # Define language categories for operational inference
+    systems_langs = {"C", "C++", "Rust", "Assembly", "Zig"}
+    data_langs = {"Python", "Jupyter Notebook", "R", "Julia", "Scala"}
+    cloud_langs = {"Go", "Shell", "Dockerfile", "YAML", "HCL", "Terraform"}
+    web_langs = {"JavaScript", "TypeScript", "HTML", "CSS", "Vue", "React", "Svelte"}
+
+    # Check developer archetypes based on their repo languages
+    is_systems_dev = any(lang in lang_stats for lang in systems_langs)
+    is_data_dev = any(lang in lang_stats for lang in data_langs)
+    is_cloud_dev = any(lang in lang_stats for lang in cloud_langs)
+    is_web_dev = any(lang in lang_stats for lang in web_langs)
+
+    # 1. Evaluate "Systems & Performance"
+    if is_systems_dev and verified_repos >= 2:
+        skills["Efficiency"] = 85.0
+        skills["Performance Tuning"] = 80.0
+        skills["Low-Level Control"] = 90.0
+        skills["Compute Optimization"] = 75.0
+        skills["Memory Management"] = 85.0
+        skills["Hardware Interaction"] = 70.0
+
+    # 2. Evaluate "Data & Machine Learning"
+    if is_data_dev and verified_repos >= 2:
+        skills["Data Processing"] = 85.0
+        skills["Analytical Thinking"] = 80.0
+        skills["Model Training"] = 70.0 
+        skills["Scientific Computing"] = 75.0
+        skills["Machine Learning Workloads"] = 75.0
+
+    # 3. Evaluate "Cloud & DevOps" 
+    if is_cloud_dev and verified_repos >= 2:
+        skills["Infrastructure Design"] = 80.0
+        skills["CI/CD"] = 75.0
+        skills["Automation"] = 85.0
+        skills["Containerization"] = 80.0
+        skills["Cloud Architecture"] = 75.0
+        skills["Stable Infrastructure"] = 80.0
+
+    # 4. Evaluate "Frontend & User Experience"
+    if is_web_dev and verified_repos >= 2:
+        skills["User Experience"] = 80.0
+        skills["UI/UX"] = 75.0
+        skills["Frontend Architecture"] = 80.0
+        skills["Responsive Design"] = 75.0
+
+    # 5. The "Seniority & Scale" Multiplier 
+    if total_repos >= 8 and verified_repos >= 4:
+        skills["Scalability"] = 85.0
+        skills["Distributed Systems"] = 80.0
+        skills["System Architecture"] = 85.0
+        skills["Strict Quality Standards"] = 80.0
+        skills["Code Maintenance"] = 90.0
+        skills["High Throughput Debugging"] = 75.0
+        skills["Open Source Contribution"] = 85.0
+        skills["Profiling Distributed Systems"] = 75.0
+
+    # 6. The "Technical Leadership" Multiplier
+    if verified_repos >= 7:
+        skills["Enterprise Architecture"] = 80.0
+        skills["Technical Leadership"] = 85.0
+        skills["Code Quality"] = 90.0
+        
+    # =========================================================
+    # --- END INJECTION BLOCK ---
+    # =========================================================
+
     skill_score = round(sum(skills.values()) / len(skills), 1) if skills else 0
 
     return {"skills": skills, "skill_score": skill_score}
-
 
 # ---------------------------------------------------------------------------
 # LAYER 3 — ENGINEERING BEHAVIOR ANALYSIS

@@ -5,81 +5,56 @@ import re
 
 class TalentMatcher:
     def __init__(self):
-        # Load the lightweight, high-performance vectorization model
         print("Loading vectorization model (all-MiniLM-L6-v2)...")
         self.model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.MATCH_THRESHOLD = 0.55 # Minimum cosine similarity to count as a match/adjacency
+        self.MATCH_THRESHOLD = 0.55 
 
-    def extract_requirements(self, job_description: str) -> list[str]:
+    def extract_requirements(self, job_description: str) -> dict:
         """
-        approach 1: local LLM (phi3) for dynamic semantic extraction
-        approach 2: huge Regex Taxonomy fallback IF the LLM fails or times out
+        Tier 1: Local LLM (Phi-3) for weighted semantic extraction.
+        Tier 2: Regex fallback.
         """
         print("Asking local phi3 to comprehend the job description...")
         
-        # --- TIER 2 DATA: The Massive Fallback Taxonomy ---
         tech_taxonomy = [
-            # Core Languages
             "Python", "Java", "C++", "C", "C#", "Rust", "Go", "JavaScript", "TypeScript", 
-            "Ruby", "PHP", "Swift", "Kotlin", "Dart", "R", "Scala", "Lua", "Shell", "Bash",
-            
-            # Roles & Domains
-            "Software Engineer", "Web Developer", "Frontend Developer", "Backend Developer", 
-            "Full Stack Developer", "Data Scientist", "Data Engineer", "Machine Learning Engineer",
-            "DevOps Engineer", "Cloud Architect", "Systems Administrator", "Product Manager",
-            
-            # AI, ML & Data
-            "Machine Learning", "Artificial Intelligence", "AI", "Deep Learning", "Data Science", 
-            "Data Processing", "Data Analytics", "NLP", "Natural Language Processing", 
-            "Computer Vision", "LLM", "Generative AI", "Pandas", "NumPy", "TensorFlow", 
-            "PyTorch", "Scikit-learn", "Big Data", "Hadoop", "Spark",
-            
-            # Web Frontend
-            "React", "Vue", "Angular", "Svelte", "HTML", "CSS", "Tailwind", "Bootstrap", 
-            "Web Development", "Frontend", "UI/UX", "Next.js", "WebAssembly",
-            
-            # Web Backend & Frameworks
-            "Node.js", "Express", "Django", "Flask", "FastAPI", "Spring Boot", "ASP.NET", 
-            "Ruby on Rails", "Laravel", "Backend", "REST API", "GraphQL", "Microservices",
-            
-            # Databases
-            "Database Design", "SQL", "NoSQL", "MySQL", "PostgreSQL", "MongoDB", "Redis", 
-            "Cassandra", "Oracle", "SQLite", "DynamoDB", "Elasticsearch", "Relational Databases",
-            
-            # Systems, Cloud & DevOps
-            "Kernel", "Operating Systems", "Linux", "Unix", "Windows", "Embedded Systems",
-            "Cloud", "Cloud Infrastructure", "AWS", "Azure", "GCP", "Google Cloud", 
-            "Docker", "Kubernetes", "Containerization", "Terraform", "Ansible", "Jenkins", 
-            "CI/CD", "DevOps", "GitHub Actions", "Serverless", "Networking",
-            
-            # Engineering Practices & Core Concepts
-            "System Architecture", "Algorithms", "Data Structures", "Open Source", 
-            "Open Source Contribution", "Git", "Version Control", "Agile", "Scrum", 
-            "TDD", "Test Driven Development", "Security", "Cryptography"
+            "Machine Learning", "Artificial Intelligence", "Data Science", "Computer Vision", 
+            "React", "Vue", "Angular", "Node.js", "Django", "SQL", "MongoDB", "PostgreSQL",
+            "Kernel", "Operating Systems", "Linux", "AWS", "Docker", "Kubernetes", "CI/CD",
+            "System Architecture", "Algorithms", "Data Structures", "Open Source"
         ]
 
-        def regex_fallback(jd_text: str) -> list[str]:
-            """Helper function to run the deterministic taxonomy scan"""
-            print("LLM extraction failed or returned empty! Falling back to Regex Taxonomy scanner...")
+        def regex_fallback(jd_text: str) -> dict:
+            print("⚠️ LLM extraction failed. Falling back to Regex Taxonomy...")
             extracted = []
             jd_lower = jd_text.lower()
             for skill in tech_taxonomy:
-                #to ensure only words are matched 
                 pattern = r'\b' + re.escape(skill.lower()) + r'\b'
                 if re.search(pattern, jd_lower):
                     extracted.append(skill)
-            return extracted if extracted else ["Software Engineering", "Programming"]
+            # If fallback triggers, assume all found skills are core
+            return {"core_skills": extracted if extracted else ["Software Engineering"], "secondary_skills": []}
 
+        # --- TIER 1: The Weighted & GitHub-Verifiable Prompt ---
         system_prompt = """
-        You are a skill extraction engine. Extract all technical and soft skills, 
-        roles, and engineering practices from the provided job description text. 
-        Return ONLY a valid JSON array of strings. 
-        Example: ["Python", "Machine Learning", "System Architecture", "Web Development"]
+        You are an expert Technical AI Recruiter. Read the job description and extract ONLY skills that can be VERIFIED through a GitHub repository (e.g., Programming Languages, Frameworks, Architecture, Cloud Infrastructure, Database Design).
+        
+        CRITICAL RULES:
+        1. EXCLUDE all non-code soft skills and methodologies (e.g., Agile, Scrum, Jira, Communication, Leadership, Pragmatic).
+        2. Categorize the verified technical skills into two exact buckets:
+           - "core_skills": The 3 to 6 absolute most critical foundational technologies required for the role.
+           - "secondary_skills": Minor tools, libraries, edge-case technologies, or nice-to-haves.
+        3. Extract atomic keywords (1 to 3 words max).
+        4. You MUST return a JSON object with exactly these two keys.
+
+        Example Output: 
+        {
+          "core_skills": ["Operating Systems", "C/C++", "Kernel Internals", "Systems Programming"],
+          "secondary_skills": ["PyTorch", "GPUs", "Profiling Tools"]
+        }
         """
         
         try:
-            import ollama
-            #calling local ollama instance('ollama run phi3' is active)
             response = ollama.chat(
                 model='phi3',
                 messages=[
@@ -93,79 +68,84 @@ class TalentMatcher:
             raw_output = response['message']['content'].strip()
             extracted_data = json.loads(raw_output)
             
-            # 1. Clean list returned
-            if isinstance(extracted_data, list) and len(extracted_data) > 0:
-                return extracted_data
-                
-            # 2. Weird dictionary returned (e.g., {"skills": ["Python"]}) for reviewing
-            elif isinstance(extracted_data, dict):
-                for key, value in extracted_data.items():
-                    if isinstance(value, list) and len(value) > 0:
-                        return value
+            # Safely extract the two tiers
+            if isinstance(extracted_data, dict) and "core_skills" in extracted_data:
+                return {
+                    "core_skills": extracted_data.get("core_skills", []),
+                    "secondary_skills": extracted_data.get("secondary_skills", [])
+                }
             
-            # 3. Valid JSON, but empty!, go back to approach 2
             return regex_fallback(job_description)
             
         except Exception as e:
-            # Catch timeouts, connection errors, or JSON parsing failures, fall back to approach 2
             print(f"Ollama Error: {e}")
             return regex_fallback(job_description)
 
     def match_candidate(self, job_description: str, github_analysis: dict) -> dict:
-        # 1. Get required skills from the JD
-        required_skills = self.extract_requirements(job_description)
-        
-        # 2. Safely extract the candidate's verified skills from github analysis 
+        requirements = self.extract_requirements(job_description)
+        core_reqs = requirements.get("core_skills", [])
+        sec_reqs = requirements.get("secondary_skills", [])
+        all_reqs = core_reqs + sec_reqs
+
         candidate_skills_dict = github_analysis.get("skill_evidence", {}).get("skills", {})
         candidate_skills = list(candidate_skills_dict.keys())
 
-        if not candidate_skills or not required_skills:
+        if not candidate_skills or not core_reqs:
             return {
                 "match_score": 0.0,
                 "matched_skills": [],
-                "missing_skills": required_skills,
-                "reasoning": "Insufficient GitHub data to perform matching against requirements.",
+                "missing_skills": all_reqs,
+                "reasoning": "Insufficient GitHub data to perform matching.",
                 "error": True
             }
 
-        # 3. Vectorize both sets of skills into dense embeddings
-        req_embeddings = self.model.encode(required_skills, convert_to_tensor=True)
         cand_embeddings = self.model.encode(candidate_skills, convert_to_tensor=True)
-
-        # 4. Compute cosine similarity matrix
-        cosine_scores = util.cos_sim(req_embeddings, cand_embeddings)
 
         matched_skills = []
         missing_skills = []
-        cumulative_score = 0.0
-
-        # 5. Evaluate adjacencies and matches
-        for i, req_skill in enumerate(required_skills):
-            # Find the candidate's closest skill to this specific requirement
-            best_match_idx = torch.argmax(cosine_scores[i]).item()
-            best_score = cosine_scores[i][best_match_idx].item()
-            best_cand_skill = candidate_skills[best_match_idx]
-
-            if best_score >= self.MATCH_THRESHOLD:
-                matched_skills.append({
-                    "required_skill": req_skill,
-                    "matched_evidence": best_cand_skill,
-                    "adjacency_confidence": round(best_score * 100, 1)
-                })
-                cumulative_score += best_score
-            else:
-                missing_skills.append(req_skill)
-
-        # 6. Calculate Final Scores and Generate Glass-Box Reasoning
-        final_match_score = round((cumulative_score / len(required_skills)) * 100, 1)
         
-        reasoning = f"Candidate satisfies {len(matched_skills)} of {len(required_skills)} core requirements based on GitHub evidence. "
-        if missing_skills:
-            reasoning += f"Notable skill gaps detected in: {', '.join(missing_skills)}."
-        else:
-            reasoning += "Candidate exhibits strong direct or adjacent capabilities for all role requirements."
+        # Helper function to calculate vector matches for a specific tier
+        def calculate_tier_score(req_list, tier_label):
+            if not req_list: return 0.0
+            req_embeddings = self.model.encode(req_list, convert_to_tensor=True)
+            cosine_scores = util.cos_sim(req_embeddings, cand_embeddings)
+            
+            cumulative = 0.0
+            for i, req_skill in enumerate(req_list):
+                best_match_idx = torch.argmax(cosine_scores[i]).item()
+                best_score = cosine_scores[i][best_match_idx].item()
+                best_cand_skill = candidate_skills[best_match_idx]
 
-        # Return the exact JSON structure required for the Glass-Box Recruiter impact area
+                if best_score >= self.MATCH_THRESHOLD:
+                    matched_skills.append({
+                        "required_skill": f"{req_skill} ({tier_label})",
+                        "matched_evidence": best_cand_skill,
+                        "adjacency_confidence": round(best_score * 100, 1)
+                    })
+                    cumulative += best_score
+                else:
+                    missing_skills.append(f"{req_skill} ({tier_label})")
+            
+            return (cumulative / len(req_list)) * 100
+
+        # Run the math for both tiers
+        core_score = calculate_tier_score(core_reqs, "Core")
+        sec_score = calculate_tier_score(sec_reqs, "Secondary")
+
+        # --- THE WEIGHTED MATH ENGINE ---
+        # Core is 80% of the grade, Secondary is 20%. 
+        if sec_reqs:
+            final_match_score = round((core_score * 0.80) + (sec_score * 0.20), 1)
+        else:
+            final_match_score = round(core_score, 1)
+
+        # Generate Glass-Box Reasoning
+        reasoning = f"Candidate scored {round(core_score, 1)}% on Core Technical Pillars and {round(sec_score, 1)}% on Secondary Tooling. "
+        if core_score < 60:
+            reasoning += "Candidate lacks critical foundational skills for this role."
+        elif final_match_score > 75:
+            reasoning += "Candidate is a highly aligned technical fit."
+
         return {
             "match_score": final_match_score,
             "matched_skills": matched_skills,
@@ -200,7 +180,7 @@ if __name__ == "__main__":
     match_results = matcher.match_candidate(raw_jd, candidate_profile)
     
     # Output the Glass-Box Report
-    print("\n===== GLASS-BOX MATCH REPORT =====")
+    print("\n===== EIGHTFOLD HACKATHON MATCH REPORT =====")
     print(f"Match Confidence:   {match_results.get('match_score')}%")
     print(f"Reasoning Engine:   {match_results.get('reasoning')}")
     
