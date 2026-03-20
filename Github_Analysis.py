@@ -3,6 +3,8 @@ Github_Analysis.py
 GitHub Engineering Intelligence Module — AI Hiring Intelligence MVP
 """
 
+MAX_COMMITS_DEPTH = 100  # How many commits to check for "quality"
+MIN_COMMIT_THRESHOLD = 5 # Minimum commits to "Verify" a skill
 import os
 import json
 import time
@@ -166,7 +168,36 @@ def fetch_repositories(username: str) -> list[dict[str, Any]]:
         return []
 
 
+def fetch_user_contribution_stats(username: str, repo_name: str) -> int:
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    url = f"{GITHUB_API_BASE}/repos/{username}/{repo_name}/stats/contributors"
+    
+    # Retry logic: Try up to 3 times if we get a 202
+    for _ in range(3):
+        resp = requests.get(url, headers=headers, timeout=10)
+        
+        if resp.status_code == 200:
+            stats = resp.json()
+            for contributor in stats:
+                if contributor['author']['login'].lower() == username.lower():
+                    return int(contributor['total'])
+            return 0
+            
+        elif resp.status_code == 202:
+            # GitHub is calculating. Wait a bit and try again.
+            time.sleep(1.0) 
+            continue
+            
+        else:
+            return 0
+    return 0
+
 def normalize_repo_data(raw_repos: list[dict]) -> list[dict[str, Any]]:
+    """Clean and format raw GitHub API data."""
     if not raw_repos or not isinstance(raw_repos, list):
         return []
 
@@ -174,6 +205,7 @@ def normalize_repo_data(raw_repos: list[dict]) -> list[dict[str, Any]]:
     for repo in raw_repos:
         if not isinstance(repo, dict):
             continue
+        # Skip forks (as per the PDF 'High-Trust' requirement)
         if repo.get("fork", False):
             continue
 
@@ -186,10 +218,10 @@ def normalize_repo_data(raw_repos: list[dict]) -> list[dict[str, Any]]:
             "created_at":  _parse_date(repo.get("created_at")),
             "updated_at":  _parse_date(repo.get("updated_at")),
             "topics":      list(repo.get("topics") or []),
+            # We don't fetch commit_count here anymore!
         })
 
     return normalized
-
 
 def _parse_date(date_str: Any) -> datetime | None:
     if not date_str or not isinstance(date_str, str):
@@ -210,45 +242,56 @@ def analyze_skill_evidence(repos: list[dict[str, Any]]) -> dict[str, Any]:
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=ACTIVE_REPO_DAYS)
-    total = len(repos)
+    total_repos = len(repos)
 
-    # Count per language: total repos, recent repos
-    lang_total: dict[str, int] = {}
-    lang_recent: dict[str, int] = {}
+    # Accumulators
+    lang_stats: dict[str, dict] = {} # { "Python": {"commits": 0, "repos": 0, "recent": 0} }
 
     for repo in repos:
         lang = repo.get("language")
-        if not lang:
-            continue
-        lang_total[lang] = lang_total.get(lang, 0) + 1
+        if not lang: continue
+        
+        if lang not in lang_stats:
+            lang_stats[lang] = {"commits": 0, "repos": 0, "recent": 0}
+        
+        commits = repo.get("commit_count", 0)
+        lang_stats[lang]["commits"] += commits
+        lang_stats[lang]["repos"] += 1
+        
         updated = repo.get("updated_at")
         if updated and updated >= cutoff:
-            lang_recent[lang] = lang_recent.get(lang, 0) + 1
+            lang_stats[lang]["recent"] += 1
 
-    if not lang_total:
+    if not lang_stats:
         return {"skills": {}, "skill_score": 0}
 
-    primary_lang = max(lang_total, key=lambda l: lang_total[l])
+    # Identify primary language by commit volume, not just repo count
+    primary_lang = max(lang_stats, key=lambda l: lang_stats[l]["commits"])
 
-    # Build skill confidence per language
     lang_confidence: dict[str, float] = {}
-    for lang, count in lang_total.items():
-        freq_score    = min(count / total, 1.0) * 50
-        recency_score = min((lang_recent.get(lang, 0) / count), 1.0) * 30
-        primary_bonus = 20 if lang == primary_lang else 0
-        lang_confidence[lang] = round(freq_score + recency_score + primary_bonus, 1)
+    for lang, stats in lang_stats.items():
+        # 1. Workload Score (Volume of Code): 50 pts
+        # Benchmarked at 50 commits for "Mastery" in a hackathon context
+        work_score = min(stats["commits"] / 50, 1.0) * 50
+        
+        # 2. Consistency Score (Spread across projects): 30 pts
+        freq_score = min(stats["repos"] / total_repos, 1.0) * 30
+        
+        # 3. Recency Score (Active usage): 20 pts
+        recency_score = (stats["recent"] / stats["repos"]) * 20
+        
+        # Bonus for the language they use the most
+        bonus = 10 if lang == primary_lang else 0
+        
+        lang_confidence[lang] = round(min(work_score + freq_score + recency_score + bonus, 100), 1)
 
-    # Map languages to skills
+    # Map to professional skills (Existing logic)
     skill_scores: dict[str, list[float]] = {}
     for lang, confidence in lang_confidence.items():
         for skill in LANGUAGE_SKILL_MAP.get(lang, [lang]):
             skill_scores.setdefault(skill, []).append(confidence)
 
-    skills = {
-        skill: round(sum(scores) / len(scores), 1)
-        for skill, scores in skill_scores.items()
-    }
-
+    skills = {s: round(sum(v)/len(v), 1) for s, v in skill_scores.items()}
     skill_score = round(sum(skills.values()) / len(skills), 1) if skills else 0
 
     return {"skills": skills, "skill_score": skill_score}
@@ -259,49 +302,40 @@ def analyze_skill_evidence(repos: list[dict[str, Any]]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def analyze_engineering_behavior(repos: list[dict[str, Any]]) -> dict[str, Any]:
-    empty = {
-        "consistency": 0,
-        "exploration": 0,
-        "depth": 0,
-        "behavior_score": 0,
-    }
-
     if not repos:
-        return empty
+        return {"consistency": 0, "exploration": 0, "depth": 0, "behavior_score": 0}
 
-    now    = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=ACTIVE_REPO_DAYS)
-    total  = len(repos)
+    total = len(repos)
 
-    active_count = sum(
-        1 for r in repos
-        if r.get("updated_at") and r["updated_at"] >= cutoff
-    )
-
-    unique_langs = len(set(
-        r["language"] for r in repos if r.get("language")
-    ))
-
-    repos_with_desc = sum(1 for r in repos if r.get("description"))
-
+    # 1. Consistency: How many repos were updated recently?
+    active_count = sum(1 for r in repos if r.get("updated_at") and r["updated_at"] >= cutoff)
     consistency = round((active_count / total) * 100, 1)
-    exploration = round(min(unique_langs * 15, 100), 1)
-    depth       = round((repos_with_desc / total) * 100, 1)
 
+    # 2. Exploration: Variety of languages used
+    unique_langs = len(set(r["language"] for r in repos if r.get("language")))
+    exploration = round(min(unique_langs * 15, 100), 1)
+
+    # 3. NEW Depth: Percentage of repos that are "Verified" (5+ commits)
+    # This proves the candidate builds things rather than just forking/starring.
+    verified_repos = sum(1 for r in repos if r.get("commit_count", 0) >= 5)
+    depth = round((verified_repos / total) * 100, 1)
+
+    # Calculate overall behavior score with new weights
     behavior_score = round(
-        consistency * BEHAVIOR_CONSISTENCY +
-        exploration * BEHAVIOR_EXPLORATION +
-        depth       * BEHAVIOR_DEPTH,
+        consistency * 0.3 + 
+        exploration * 0.3 + 
+        depth * 0.4, # Weight depth slightly higher for "High Trust"
         1
     )
 
     return {
-        "consistency":    consistency,
-        "exploration":    exploration,
-        "depth":          depth,
+        "consistency": consistency,
+        "exploration": exploration,
+        "depth": depth,
         "behavior_score": behavior_score,
     }
-
 
 # ---------------------------------------------------------------------------
 # LAYER 4 — DEVELOPER PROFILE ENGINE
@@ -572,20 +606,46 @@ def _empty_result() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def analyze_github(username: str) -> dict[str, Any]:
+    # 1. Fetch raw list
     raw_repos = fetch_repositories(username)
-    repos     = normalize_repo_data(raw_repos)
+    if not raw_repos:
+        return _empty_result()
 
+    # 2. Normalize (No username needed here anymore)
+    repos = normalize_repo_data(raw_repos)
     if not repos:
         return _empty_result()
 
-    skills    = analyze_skill_evidence(repos)
-    behavior  = analyze_engineering_behavior(repos)
-    profile   = classify_developer_profile(repos, behavior, skills)
-    scores    = compute_engineering_scores(skills, behavior, profile, len(repos))
-    analytics = generate_analytics_data(repos, skills, scores)
+    # 3. Sort by recency (Standard Hackathon Strategy)
+    repos = sorted(
+        repos, 
+        key=lambda x: x.get('updated_at') or datetime.min.replace(tzinfo=timezone.utc), 
+        reverse=True
+    )
+    
+    # 4. Deep Verification (Where the 'username' is used)
+    top_repos = repos[:5]
+    other_repos = repos[5:]
 
-    return merge_outputs(skills, behavior, profile, scores, analytics, repos)
+    for repo in top_repos:
+        # We have the username here, so no NameError!
+        repo['commit_count'] = fetch_user_contribution_stats(username, repo['name'])
+        repo['is_verified'] = repo['commit_count'] >= 5
+        
+    for repo in other_repos:
+        repo['commit_count'] = 1  # Standard weight for non-verified repos
+        repo['is_verified'] = False
 
+    verified_repos = top_repos + other_repos
+
+    # 5. Pass the verified data to your analysis engines
+    skills    = analyze_skill_evidence(verified_repos)
+    behavior  = analyze_engineering_behavior(verified_repos)
+    profile   = classify_developer_profile(verified_repos, behavior, skills)
+    scores    = compute_engineering_scores(skills, behavior, profile, len(verified_repos))
+    analytics = generate_analytics_data(verified_repos, skills, scores)
+
+    return merge_outputs(skills, behavior, profile, scores, analytics, verified_repos)
 # ---------------------------------------------------------------------------
 # MAIN RUNNER (TEST EXECUTION)
 # ---------------------------------------------------------------------------
@@ -642,8 +702,14 @@ def main():
 
     for r in intel["risks"]:
         print(f"- {r}")
+    
+    # Add a "Verified" badge in the UI/Terminal
+    for skill, score in top_skills:
+        status = "VERIFIED EVIDENCE" if score > 70 else "LOW SIGNAL"
+        print(f"{skill}: {score} [{status}]")
 
     print("\n==========================================\n")
+    
 
 
 if __name__ == "__main__":
