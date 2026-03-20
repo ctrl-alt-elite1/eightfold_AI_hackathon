@@ -7,23 +7,19 @@ Areas 01 + 02: Signal Extraction + Learning Trajectory
 Run:
     streamlit run app.py
 
-Required env vars (at least one):
-    GITHUB_TOKEN      (optional but avoids rate limits)
-    GROQ_API_KEY      (free — recommended for hackathon)
-    OPENAI_API_KEY
-    ANTHROPIC_API_KEY
+Required env vars:
+    GITHUB_TOKEN   (optional but strongly recommended)
 """
 
 import streamlit as st
 import os
 import sys
 
-# Make sure local modules are importable
 sys.path.insert(0, os.path.dirname(__file__))
 
-from github_analyser import analyse_github, GithubProfile
+from Github_Analysis import analyze_github
+from Job_Matcher import TalentMatcher
 from skill_graph import build_skill_graph, compute_learning_trajectory
-from llm_engine import extract_skills_from_text, analyse_gap, generate_match_report, bias_check
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -39,41 +35,40 @@ st.title("🧠 Talent Intelligence System")
 st.caption("Post-Resume Era · Areas 01 & 02 · Eightfold AI × Techkriti '26")
 
 # ---------------------------------------------------------------------------
-# Sidebar: API keys + settings
+# Sidebar
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.header("⚙️ Configuration")
 
     github_token = st.text_input(
-        "GitHub Token (optional)", type="password",
+        "GitHub Token (recommended)", type="password",
         value=os.getenv("GITHUB_TOKEN", ""),
         help="Avoids GitHub rate limits. Generate at github.com/settings/tokens",
     )
     if github_token:
         os.environ["GITHUB_TOKEN"] = github_token
 
-    llm_key_type = st.selectbox("LLM Provider", ["Groq (free)", "OpenAI", "Anthropic"])
-    llm_key = st.text_input(f"{llm_key_type} API Key", type="password")
-    if llm_key:
-        key_map = {"Groq (free)": "GROQ_API_KEY", "OpenAI": "OPENAI_API_KEY", "Anthropic": "ANTHROPIC_API_KEY"}
-        os.environ[key_map[llm_key_type]] = llm_key
-
     st.divider()
     st.caption("Built for Techkriti '26 Hackathon")
 
 # ---------------------------------------------------------------------------
-# Build skill graph once (cached)
+# Cached resources — built once per session
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
 def get_skill_graph():
     return build_skill_graph()
 
+@st.cache_resource
+def get_matcher():
+    return TalentMatcher()   # loads sentence-transformer model once
+
 skill_graph = get_skill_graph()
+matcher     = get_matcher()
 
 # ---------------------------------------------------------------------------
-# Main layout: two columns
+# Main layout
 # ---------------------------------------------------------------------------
 
 col_left, col_right = st.columns([1, 1], gap="large")
@@ -85,12 +80,6 @@ with col_left:
         "GitHub Username",
         placeholder="e.g. torvalds",
         help="Public GitHub profile to analyse",
-    )
-
-    resume_text = st.text_area(
-        "Resume / Additional Skills (optional)",
-        height=160,
-        placeholder="Paste resume text or a skill list here. This supplements GitHub signals.",
     )
 
 with col_right:
@@ -112,8 +101,8 @@ st.divider()
 run_btn = st.button("🚀 Analyse Candidate", type="primary", use_container_width=True)
 
 if run_btn:
-    if not github_username and not resume_text:
-        st.error("Please enter a GitHub username or paste resume text.")
+    if not github_username:
+        st.error("Please enter a GitHub username.")
         st.stop()
     if not job_description:
         st.error("Please paste a job description.")
@@ -122,75 +111,62 @@ if run_btn:
     # -----------------------------------------------------------------------
     # Step 1: GitHub analysis (Area 01)
     # -----------------------------------------------------------------------
-    github_profile = None
-    github_skills = []
+    github_result = None
 
-    if github_username:
-        with st.spinner(f"Analysing GitHub profile: @{github_username}…"):
-            try:
-                github_profile = analyse_github(github_username)
-                github_skills = github_profile.inferred_skills
-                st.success(f"✓ GitHub profile loaded — {github_profile.total_repos} repos, "
-                           f"{github_profile.total_stars} stars, "
-                           f"complexity {github_profile.avg_repo_complexity}/10")
-            except Exception as e:
-                st.warning(f"GitHub error: {e}. Continuing with resume only.")
+    with st.spinner(f"Analysing GitHub profile: @{github_username}…"):
+        try:
+            github_result = analyze_github(github_username)
+
+            intel    = github_result["github_engineering_intelligence"]
+            profile  = github_result["developer_profile"]
+            behavior = github_result["engineering_behavior"]
+            skills   = github_result["skill_evidence"]
+
+            st.success(
+                f"✓ @{github_username} loaded — "
+                f"Score {intel['overall_score']}/100 · "
+                f"{intel['confidence']} confidence · "
+                f"Archetype: {profile['archetype']} · "
+                f"Velocity: {profile['learning_velocity']}"
+            )
+        except Exception as e:
+            st.error(f"GitHub analysis failed: {e}")
+            st.stop()
 
     # -----------------------------------------------------------------------
-    # Step 2: Skill extraction from resume + GitHub
+    # Step 2: Semantic vector matching — JD vs GitHub skills (Area 01)
     # -----------------------------------------------------------------------
-    all_candidate_skills = list(set(github_skills))
+    with st.spinner("Running semantic vector matching…"):
+        match = matcher.match_candidate(job_description, github_result)
 
-    if resume_text:
-        with st.spinner("Extracting skills from resume…"):
-            resume_skills = extract_skills_from_text(resume_text, context_hint="This is a resume.")
-            all_candidate_skills = list(set(all_candidate_skills + resume_skills))
-
-    if not all_candidate_skills:
-        st.error("No skills could be extracted. Check your GitHub token or add resume text.")
+    # Check if matching failed due to insufficient GitHub data
+    if match.get("error"):
+        st.error(
+            "Insufficient GitHub data to perform matching. "
+            "The profile may have no public repositories or the token may be missing."
+        )
         st.stop()
 
-    # Extract required skills from JD
-    with st.spinner("Parsing job description…"):
-        jd_skills = extract_skills_from_text(job_description, context_hint="This is a job description.")
+    # -----------------------------------------------------------------------
+    # Step 3: Learning trajectory (Area 02)
+    # -----------------------------------------------------------------------
 
-    # -----------------------------------------------------------------------
-    # Step 3: LLM gap analysis (Area 01 — explainability)
-    # -----------------------------------------------------------------------
-    with st.spinner("Running gap analysis…"):
-        gap = analyse_gap(
-            candidate_skills=all_candidate_skills,
-            job_description=job_description,
-            github_summary=github_profile.raw_summary if github_profile else "",
-        )
+    # Flat skill list from GitHub domain skills for the graph
+    candidate_skill_list = list(
+        github_result["skill_evidence"].get("skills", {}).keys()
+    )
 
-    # -----------------------------------------------------------------------
-    # Step 4: Learning trajectory (Area 02)
-    # -----------------------------------------------------------------------
+    # Required skills = everything from matched + missing
+    required_skill_list = [
+        m["required_skill"] for m in match.get("matched_skills", [])
+    ] + match.get("missing_skills", [])
+
     with st.spinner("Computing learning trajectory…"):
         trajectory = compute_learning_trajectory(
-            candidate_skills=all_candidate_skills,
-            required_skills=jd_skills,
+            candidate_skills=candidate_skill_list,
+            required_skills=required_skill_list,
             graph=skill_graph,
         )
-
-    # -----------------------------------------------------------------------
-    # Step 5: Explainability report
-    # -----------------------------------------------------------------------
-    with st.spinner("Generating explainability report…"):
-        report = generate_match_report(
-            username=github_username or "Candidate",
-            candidate_skills=all_candidate_skills,
-            gap_analysis=gap,
-            trajectory_reasoning=trajectory.reasoning,
-            job_title=job_title or "the role",
-        )
-
-    # -----------------------------------------------------------------------
-    # Step 6: Bias check
-    # -----------------------------------------------------------------------
-    with st.spinner("Running bias check…"):
-        bias = bias_check(all_candidate_skills, job_description)
 
     # ===================================================================
     # RESULTS DISPLAY
@@ -200,25 +176,28 @@ if run_btn:
     st.header("📊 Results")
 
     # --- Top-line score row ---
-    score_col, ttp_col, adj_col = st.columns(3)
+    score_col, ttp_col, adj_col, github_col = st.columns(4)
 
-    match_score = gap.get("match_score", 0)
-    score_color = "green" if match_score >= 70 else "orange" if match_score >= 45 else "red"
+    match_score = match.get("match_score", 0)
 
     with score_col:
         st.metric("Match Score", f"{match_score}/100")
-        st.progress(match_score / 100)
+        st.progress(min(match_score / 100, 1.0))
 
     with ttp_col:
         weeks = trajectory.total_weeks_to_productivity
-        band = trajectory.productivity_band
+        band  = trajectory.productivity_band
         label = "Immediate" if weeks == 0 else f"~{weeks} weeks"
         st.metric("Time to Productivity", label)
         st.caption(f"Band: **{band}**")
 
     with adj_col:
         st.metric("Adjacency Score", f"{trajectory.adjacency_score}/100")
-        st.caption("Combines current skills + learning potential")
+        st.caption("Current skills + learning potential")
+
+    with github_col:
+        st.metric("GitHub Score", f"{intel['overall_score']}/100")
+        st.caption(f"{profile['archetype']} · {profile['learning_velocity']} velocity")
 
     st.divider()
 
@@ -226,43 +205,55 @@ if run_btn:
     res_left, res_right = st.columns([1, 1], gap="large")
 
     with res_left:
-        # Skill signals
         st.subheader("🔬 Signal Extraction (Area 01)")
 
-        if github_profile:
-            with st.expander("GitHub Signals", expanded=True):
-                st.write(f"**Top languages:** {', '.join(github_profile.top_languages[:5])}")
-                st.write(f"**Repos:** {github_profile.total_repos}  |  "
-                         f"**Stars:** {github_profile.total_stars}  |  "
-                         f"**Complexity:** {github_profile.avg_repo_complexity}/10")
-                st.caption(github_profile.raw_summary)
+        # GitHub behaviour signals
+        with st.expander("GitHub Engineering Signals", expanded=True):
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                st.metric("Consistency", f"{behavior['consistency']:.0f}%")
+            with b2:
+                st.metric("Depth", f"{behavior['depth']:.0f}%")
+            with b3:
+                st.metric("Exploration", f"{behavior['exploration']:.0f}%")
 
-        matched = gap.get("matched_skills", [])
-        missing = gap.get("missing_skills", [])
-        transferable = gap.get("transferable_skills", [])
+            domain_skills = skills.get("skills", {})
+            if domain_skills:
+                st.write("**Verified domain skills:**")
+                for domain, score in sorted(domain_skills.items(), key=lambda x: -x[1])[:6]:
+                    badge = "🟢" if score > 70 else "🟡"
+                    st.progress(score / 100, text=f"{badge} {domain} ({score:.0f})")
 
-        if matched:
-            st.success(f"**✓ Matched skills ({len(matched)}):** {', '.join(matched)}")
-        if missing:
-            st.error(f"**✗ Missing skills ({len(missing)}):** {', '.join(missing)}")
-        if transferable:
-            st.info(f"**↝ Transferable:** {', '.join(transferable)}")
+            for s in intel.get("strengths", []):
+                st.success(f"✓ {s}")
+            for r in intel.get("risks", []):
+                st.warning(f"⚠ {r}")
 
-        # Bias check
-        st.subheader("⚖️ Bias Check")
-        bc = bias
-        if bc["bias_check_passed"]:
-            st.success(bc["verdict"])
-        else:
-            st.warning(bc["verdict"])
-        st.caption(
-            f"Score with context: {bc['score_with_context']}  |  "
-            f"Score without demographics: {bc['score_without_demographics']}  |  "
-            f"Δ = {bc['delta']} pts"
+        # Semantic match results
+        matched_list = match.get("matched_skills", [])   # list of dicts
+        missing_list = match.get("missing_skills", [])   # list of strings
+
+        if matched_list:
+            st.write(f"**✓ Matched capabilities ({len(matched_list)}):**")
+            for m in matched_list:
+                st.success(
+                    f"✓ **{m['required_skill']}** → "
+                    f"evidenced by *{m['matched_evidence']}* "
+                    f"({m['adjacency_confidence']}% confidence)"
+                )
+
+        if missing_list:
+            st.error(f"**✗ Missing ({len(missing_list)}):** {', '.join(missing_list)}")
+
+        # Bias note
+        st.subheader("⚖️ Bias Awareness")
+        st.info(
+            "Scores are derived purely from GitHub artefacts — commit patterns, "
+            "language depth, and project complexity. Name, gender, university, "
+            "and demographic fields are never used in this system."
         )
 
     with res_right:
-        # Learning trajectory
         st.subheader("📈 Learning Trajectory (Area 02)")
 
         if trajectory.skill_gaps:
@@ -284,16 +275,41 @@ if run_btn:
         else:
             st.success("No skill gaps — candidate meets all requirements.")
 
-        # Candidate's full skill set
+        # Tech evolution
+        evo = github_result.get("analytics", {}).get("tech_evolution", {})
+        if evo:
+            with st.expander("Tech evolution timeline"):
+                for year in sorted(evo.keys())[-5:]:
+                    st.write(f"**{year}:** {', '.join(evo[year])}")
+
         with st.expander("All detected candidate skills"):
-            st.write(", ".join(sorted(all_candidate_skills)))
+            st.write(", ".join(sorted(candidate_skill_list)))
 
     # --- Explainability report ---
     st.divider()
     st.subheader("📝 Explainability Report")
-    st.info(report)
+
+    report_lines = [
+        f"**Candidate:** @{github_username}  |  **Role:** {job_title or 'the role'}",
+        f"**Match Score:** {match_score}/100  |  "
+        f"**GitHub Engineering Score:** {intel['overall_score']}/100  |  "
+        f"**Confidence:** {intel['confidence']}",
+        "",
+        match.get("reasoning", ""),
+        "",
+        f"**Developer Profile:** {profile['archetype']} — {profile['learning_velocity']} "
+        f"learning velocity. Potential score: {profile['potential_score']:.0f}/100.",
+        "",
+        f"**Time to Productivity:** {label} ({band}). "
+        f"Adjacency score: {trajectory.adjacency_score}/100.",
+        "",
+        f"**Strengths:** {', '.join(intel['strengths']) if intel['strengths'] else 'None detected.'}",
+        f"**Risks:** {', '.join(intel['risks']) if intel['risks'] else 'None detected.'}",
+    ]
+
+    st.info("\n".join(report_lines))
 
     st.caption(
         "This system does not rely on name, gender, or institutional prestige. "
-        "Scores are derived from verified skill signals and graph-based learning trajectory modelling."
+        "Scores are derived from verified GitHub signals and semantic vector matching."
     )
