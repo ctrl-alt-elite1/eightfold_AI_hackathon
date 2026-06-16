@@ -1,4 +1,4 @@
-# Talent Intelligence System
+# TalentRank - Talent Intelligence System
 **Techkriti '26 × Eightfold AI Hackathon — Impact Areas 01 & 02**
 
 ---
